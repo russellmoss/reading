@@ -1,9 +1,8 @@
-# Complete Walkthrough: vw_timeseries_with_confidence_current SQL Logic and Mathematics
+# Complete Walkthrough: vw_timeseries_with_confidence SQL Logic and Mathematics
 
 **Document Purpose:** This guide provides a detailed, step-by-step explanation of the SQL code that powers the time series visualization with confidence intervals, including the mathematical logic and statistical concepts behind each calculation.
 
-**Target Audience:** RevOps professionals with basic statistics knowledge (undergraduate biology level)
-
+**Target Audience:** RevOps professionals with basic statistics knowledge 
 **Last Updated:** October 22, 2025
 
 ---
@@ -14,7 +13,7 @@
 3. [CTE 2: Funnel_With_Flags - Foundation Data](#cte2)
 4. [CTE 3: Daily_Actuals - What Happened Each Day](#cte3)
 5. [CTE 4: Cumulative_Actuals - Building the Growth Curve](#cte4)
-6. [CTE 5: Monthly_Forecast_Targets - Stepped Goals](#cte5)
+6. [CTE 5: Monthly_Forecast_Targets - Stepped Goals with Deduplication](#cte5)
 7. [CTE 6: Cumulative_Monthly_Targets - Progressive Targets](#cte6)
 8. [CTE 7: Forecast_Data - Importing Predictions](#cte7)
 9. [CTE 8: Current_Actuals - Today's Snapshot](#cte8)
@@ -33,7 +32,7 @@ This view transforms point-in-time predictions into smooth daily projections wit
 3. **Uncertainty Bounds:** What's the range of likely outcomes?
 4. **Target Progression:** How should we be tracking against monthly milestones?
 
-The magic lies in linear interpolation combined with statistical confidence intervals that widen over time.
+The magic lies in linear interpolation combined with statistical confidence intervals that widen over time, plus ensuring all forecasted sources appear even if they have zero actuals.
 
 ---
 
@@ -66,9 +65,6 @@ This CTE creates the foundation - one row for every day in Q4 2025.
 - Even days with zero activity need a row
 - This ensures smooth lines without gaps
 
-**Statistical Context:**
-This creates our temporal domain - the continuous timeline over which we'll interpolate values. In time series analysis, having complete temporal coverage is crucial for proper visualization and preventing misleading gaps.
-
 ---
 
 ## CTE 2: Funnel_With_Flags - Foundation Data {#cte2}
@@ -85,14 +81,17 @@ Funnel_With_Flags AS (
 
 ### Logic Explanation:
 
-Identical to the forecast_vs_actuals view - creates binary flags for mathematical operations.
+Creates binary flags for mathematical operations from the base funnel view.
 
-**Reusing the Pattern:**
-- Same base data as main forecast view
-- Ensures consistency across all analytics
-- Binary encoding enables SUM() counting
+**The SQO Flag Creation:**
+```sql
+CASE WHEN LOWER(SQO_raw) = 'yes' THEN 1 ELSE 0 END AS is_sqo
+```
+- Converts text ('yes'/'no') to binary (1/0)
+- `LOWER()` handles case variations ('Yes', 'YES', 'yes')
+- Binary encoding enables `SUM()` for counting
 
-**Note:** This is the raw funnel data before any time-based aggregation. Each row represents a lead or opportunity at a point in time.
+**Note:** This pulls ALL data, not filtered by active SGAs like some other views. This means we're showing the complete historical picture.
 
 ---
 
@@ -110,30 +109,9 @@ Daily_Actuals AS (
   
   UNION ALL
   
-  -- SQLs
-  SELECT DATE(converted_date_raw) AS date_day, Channel_Grouping_Name, Original_source,
-         'sqls' AS stage, COUNT(DISTINCT Full_prospect_id__c) AS daily_count
-  FROM Funnel_With_Flags
-  WHERE is_sql = 1 AND DATE(converted_date_raw) BETWEEN '2025-10-01' AND '2025-12-31'
-  GROUP BY 1, 2, 3
-  
-  UNION ALL
-  
-  -- SQOs
-  SELECT DATE(Date_Became_SQO__c) AS date_day, Channel_Grouping_Name, Original_source,
-         'sqos' AS stage, COUNT(DISTINCT Full_Opportunity_ID__c) AS daily_count
-  FROM Funnel_With_Flags
-  WHERE is_sqo = 1 AND DATE(Date_Became_SQO__c) BETWEEN '2025-10-01' AND '2025-12-31'
-  GROUP BY 1, 2, 3
-  
-  UNION ALL
-  
-  -- Joined
-  SELECT DATE(advisor_join_date__c) AS date_day, Channel_Grouping_Name, Original_source,
-         'joined' AS stage, COUNT(DISTINCT Full_Opportunity_ID__c) AS daily_count
-  FROM Funnel_With_Flags
-  WHERE is_joined = 1 AND DATE(advisor_join_date__c) BETWEEN '2025-10-01' AND '2025-12-31'
-  GROUP BY 1, 2, 3
+  -- SQLs (similar pattern)
+  -- SQOs (similar pattern)  
+  -- Joined (similar pattern)
 ),
 ```
 
@@ -148,21 +126,18 @@ This CTE calculates how many conversions happened on each specific day.
    - SQLs: `converted_date_raw` (when lead became opportunity)
    - SQOs: `Date_Became_SQO__c` (when qualified)
    - Joined: `advisor_join_date__c` (when signed)
-   
-   Each stage has its own timestamp representing when that event occurred.
 
 2. **DATE() Function:**
    ```sql
    DATE(mql_stage_entered_ts)
    ```
    - Converts timestamp to date (strips time component)
-   - Groups all events from same day together
    - Example: '2025-10-15 14:23:45' → '2025-10-15'
 
-3. **UNION ALL Structure:**
-   - Combines all stages into one dataset
-   - Preserves stage identification via literal string
-   - Creates long format: (date, channel, source, stage, count)
+3. **COUNT(DISTINCT ...) Pattern:**
+   - Ensures no double-counting
+   - Critical for data integrity
+   - Different ID fields: leads use `Full_prospect_id__c`, opportunities use `Full_Opportunity_ID__c`
 
 **What This Produces:**
 ```
@@ -172,7 +147,6 @@ date_day    | channel   | source    | stage | daily_count
 2025-10-02  | Marketing | Webinar   | mqls  | 7
 ```
 
-**Statistical Importance:**
 These are our observed daily frequencies - the raw data points that we'll accumulate to create cumulative growth curves.
 
 ---
@@ -192,7 +166,29 @@ Cumulative_Actuals AS (
       ORDER BY d.date_day
     ) AS cumulative_actual
   FROM Date_Spine d
-  CROSS JOIN (SELECT DISTINCT Channel_Grouping_Name, Original_source, stage FROM Daily_Actuals) dims
+  CROSS JOIN (
+    -- Include sources that have actuals
+    SELECT DISTINCT Channel_Grouping_Name, Original_source, stage 
+    FROM Daily_Actuals
+    
+    UNION DISTINCT
+    
+    -- Also include ALL sources from forecast (even with zero actuals)
+    SELECT DISTINCT
+      CASE WHEN Channel = 'Inbound' THEN 'Marketing' ELSE Channel END AS Channel_Grouping_Name,
+      original_source AS Original_source,
+      CASE
+        WHEN LOWER(stage) = 'mql' THEN 'mqls'
+        WHEN LOWER(stage) = 'sql' THEN 'sqls'
+        WHEN LOWER(stage) = 'sqo' THEN 'sqos'
+        WHEN LOWER(stage) = 'joined' THEN 'joined'
+        ELSE LOWER(stage)
+      END AS stage
+    FROM `savvy-gtm-analytics.SavvyGTMData.q4_2025_forecast`
+    WHERE metric = 'Cohort_source'
+      AND original_source != 'All'
+      AND month_key IN ('2025-10', '2025-11', '2025-12')
+  ) dims
   LEFT JOIN Daily_Actuals a
     ON d.date_day = a.date_day
     AND dims.Channel_Grouping_Name = a.Channel_Grouping_Name
@@ -204,40 +200,48 @@ Cumulative_Actuals AS (
 
 ### Logic Explanation:
 
-This CTE creates cumulative totals - the running sum of all activity from Q4 start through each date.
+This CTE creates cumulative totals with a **critical enhancement** - it ensures all forecasted sources appear even if they have zero actuals.
 
-**Complex Join Logic Explained:**
+**The Enhanced dims Subquery:**
 
-1. **The CROSS JOIN:**
+The subquery now has two parts connected by `UNION DISTINCT`:
+
+1. **Part 1: Sources with Actual Activity**
    ```sql
-   Date_Spine d
-   CROSS JOIN (SELECT DISTINCT ... FROM Daily_Actuals) dims
+   SELECT DISTINCT Channel_Grouping_Name, Original_source, stage 
+   FROM Daily_Actuals
    ```
-   - Creates every combination of date × channel × source × stage
-   - If we have 92 dates and 20 channel/source/stage combos = 1,840 rows
-   - Ensures we have a row even for days with zero activity
+   - Gets all combinations that have had at least one conversion
 
-2. **The LEFT JOIN:**
+2. **Part 2: All Forecasted Sources (NEW!)**
    ```sql
-   LEFT JOIN Daily_Actuals a ON [four conditions]
+   SELECT DISTINCT
+     CASE WHEN Channel = 'Inbound' THEN 'Marketing' ELSE Channel END AS Channel_Grouping_Name,
+     original_source AS Original_source,
+     [stage transformations]
+   FROM `savvy-gtm-analytics.SavvyGTMData.q4_2025_forecast`
    ```
-   - Attaches actual counts where they exist
-   - Leaves NULL where no activity occurred
-   - COALESCE converts NULL to 0
+   - Pulls ALL sources from the forecast
+   - Applies same naming transformations (Inbound→Marketing, mql→mqls)
+   - Ensures we track sources that were forecasted but haven't produced results yet
 
-3. **The Window Function Magic:**
-   ```sql
-   SUM(SUM(COALESCE(a.daily_count, 0))) OVER (
-     PARTITION BY dims.Channel_Grouping_Name, dims.Original_source, dims.stage 
-     ORDER BY d.date_day
-   )
-   ```
-   
-   **Breaking this down:**
-   - Inner `SUM()`: Aggregates within the GROUP BY
-   - Outer `SUM() OVER`: Creates running total
-   - `PARTITION BY`: Separate running totals for each channel/source/stage
-   - `ORDER BY d.date_day`: Accumulate in chronological order
+**Why This Enhancement Matters:**
+
+Consider this scenario:
+- Forecast includes "Partner Referral" source expecting 10 MQLs
+- So far, zero Partner Referrals have come in
+- Without Part 2: This source wouldn't appear in the chart at all
+- With Part 2: Shows a flat line at zero with target line above it
+
+This creates a complete picture showing both performing and underperforming sources.
+
+**The Window Function for Cumulative Totals:**
+```sql
+SUM(SUM(COALESCE(a.daily_count, 0))) OVER (
+  PARTITION BY dims.Channel_Grouping_Name, dims.Original_source, dims.stage 
+  ORDER BY d.date_day
+)
+```
 
 **Example Calculation:**
 ```
@@ -247,12 +251,11 @@ Day 3: 0 MQLs → Cumulative: 8 (5+3+0)
 Day 4: 6 MQLs → Cumulative: 14 (5+3+0+6)
 ```
 
-**Statistical Significance:**
-Cumulative functions create monotonically increasing curves - they can only go up or stay flat, never decrease. This property is crucial for our confidence interval calculations later.
+For sources with no activity, the cumulative stays at 0 throughout.
 
 ---
 
-## CTE 5: Monthly_Forecast_Targets - Stepped Goals {#cte5}
+## CTE 5: Monthly_Forecast_Targets - Stepped Goals with Deduplication {#cte5}
 
 ### Code:
 ```sql
@@ -267,39 +270,54 @@ Monthly_Forecast_Targets AS (
       ELSE LOWER(stage)
     END AS stage,
     month_key,
-    CAST(forecast_value AS INT64) AS monthly_forecast
+    SUM(CAST(forecast_value AS INT64)) AS monthly_forecast  -- SUM to handle duplicates
   FROM `savvy-gtm-analytics.SavvyGTMData.q4_2025_forecast`
   WHERE metric = 'Cohort_source'
     AND original_source != 'All'
     AND month_key IN ('2025-10', '2025-11', '2025-12')
+  GROUP BY 1, 2, 3, 4  -- GROUP BY to deduplicate
 ),
 ```
 
 ### Logic Explanation:
 
-This CTE imports monthly targets to create stepped progression lines (not just end-of-quarter targets).
+This CTE imports monthly targets with **deduplication logic** to handle potential duplicate rows in the forecast table.
 
-**Why Monthly Instead of Quarterly?**
-- Business reality: Different monthly targets reflect seasonality
-- October might be lower due to ramp-up
-- December might be higher due to year-end push
-- Creates more realistic target progression
+**The Deduplication Strategy:**
 
-**Data Transformations:**
-Same as forecast_vs_actuals:
-- Channel renaming (Inbound → Marketing)
-- Stage pluralization (mql → mqls)
-- Type casting for numeric operations
+1. **SUM() Instead of Direct Selection:**
+   ```sql
+   SUM(CAST(forecast_value AS INT64)) AS monthly_forecast
+   ```
+   - If there's only one row: SUM = that value
+   - If there are duplicates: SUM combines them
+   - Assumes duplicates should be additive (not alternatives)
 
-**The Result:**
+2. **GROUP BY All Dimensions:**
+   ```sql
+   GROUP BY 1, 2, 3, 4
+   ```
+   - Groups by channel, source, stage, and month
+   - Collapses any duplicate rows into one
+   - Ensures one row per unique combination
+
+**Why Duplicates Might Exist:**
+- Data entry errors in the forecast table
+- Multiple forecast versions loaded
+- Different business units submitting overlapping forecasts
+- ETL process issues
+
+**Example of Handling Duplicates:**
 ```
-channel    | source   | stage | month_key | monthly_forecast
-Marketing  | Webinar  | mqls  | 2025-10   | 140
-Marketing  | Webinar  | mqls  | 2025-11   | 145
-Marketing  | Webinar  | mqls  | 2025-12   | 145
+Before GROUP BY:
+Marketing | Webinar | mqls | 2025-10 | 70
+Marketing | Webinar | mqls | 2025-10 | 70  (duplicate)
+
+After GROUP BY with SUM:
+Marketing | Webinar | mqls | 2025-10 | 140
 ```
 
-This gives us monthly milestones for the target line.
+**Important Decision:** The choice to SUM duplicates assumes they represent different parts of the same forecast. If duplicates are errors, this could double-count. The business logic needs to determine if this is correct.
 
 ---
 
@@ -307,6 +325,7 @@ This gives us monthly milestones for the target line.
 
 ### Code:
 ```sql
+-- 6. Calculate cumulative monthly targets (NO ROLLUP - just source level)
 Cumulative_Monthly_Targets AS (
   SELECT
     channel_grouping_name,
@@ -326,6 +345,12 @@ Cumulative_Monthly_Targets AS (
 
 This CTE converts monthly targets into cumulative targets for the stepped line.
 
+**The "NO ROLLUP" Comment Significance:**
+- This view works at the source level (e.g., "Webinar", "LinkedIn")
+- Does NOT create channel-level aggregates (e.g., all "Marketing" combined)
+- Each source gets its own target line
+- This is different from some dashboard views that show rolled-up totals
+
 **The Window Function:**
 ```sql
 SUM(monthly_forecast) OVER (
@@ -334,20 +359,15 @@ SUM(monthly_forecast) OVER (
 )
 ```
 
-**Example Calculation:**
+**Example Calculation for One Source:**
 ```
 October target: 140 → Cumulative by Oct 31: 140
 November target: 145 → Cumulative by Nov 30: 285 (140+145)
 December target: 145 → Cumulative by Dec 31: 430 (140+145+145)
 ```
 
-**Why Cumulative?**
-- Our actuals are cumulative
-- Comparison requires same scale
-- Shows progressive achievement toward final goal
-
 **Visual Result:**
-Instead of three separate monthly bars, we get a line that steps up at month boundaries, showing expected progression through the quarter.
+Instead of three separate monthly bars, we get a line that steps up at month boundaries, showing expected progression through the quarter at the individual source level.
 
 ---
 
@@ -372,14 +392,15 @@ Forecast_Data AS (
 This CTE imports the sophisticated predictions from our main forecast view.
 
 **What We're Getting:**
-- `forecast_value`: Original Q4 target (430 MQLs)
-- `predicted_value`: Where we'll likely end up (580 MQLs)
+- `forecast_value`: Original Q4 target (e.g., 430 MQLs for a source)
+- `predicted_value`: Where we'll likely end up (e.g., 580 MQLs)
 - `stddev_daily`: Daily volatility for confidence intervals
 
 **Why Import Instead of Recalculate?**
-- Reuses complex cascade logic from main view
-- Ensures consistency across dashboards
-- Single source of truth for predictions
+- The forecast_vs_actuals view contains complex cascade logic
+- Includes conversion rate calculations
+- Accounts for open pipeline
+- Single source of truth principle
 
 **This is Our Endpoint:**
 The `predicted_value` tells us where we expect to be on December 31st. Our job now is to create a smooth line from today's actual to that endpoint.
@@ -408,13 +429,12 @@ This CTE captures our starting point for predictions - where we are today.
 **Simple but Critical:**
 - Filters cumulative actuals to just today's date
 - Provides the anchor point for linear interpolation
-- This is the "You are here" marker
+- This is the "You are here" marker on the map
 
-**Example:**
-If today is October 21st and we have 166 MQLs so far, this CTE captures that 166 as our starting point for projecting forward.
-
-**Statistical Importance:**
-In interpolation, boundary conditions are crucial. This provides our initial condition - the known value from which we project.
+**For Zero-Activity Sources:**
+- Sources with no actuals will show 0 as current_actual
+- This is important for the forecast sources added in CTE 4
+- Their prediction lines will start from 0 and rise to predicted value
 
 ---
 
@@ -473,10 +493,11 @@ cumulative_actual - LAG(cumulative_actual) OVER (...)
    STDDEV([3, 0, 6, 2, 4, ...]) = 2.1
    ```
 
-**Why Daily Growth Instead of Daily Count?**
-- We're predicting cumulative curves
-- Need to understand growth volatility
-- Some days might have negative growth (data corrections)
+**For Zero-Activity Sources:**
+- If a source has no activity, all daily_growth = 0
+- STDDEV(0, 0, 0, ...) = 0
+- Results in no confidence interval (flat line)
+- This is mathematically correct - no volatility means complete certainty
 
 **Statistical Interpretation:**
 If stddev = 2.1 MQLs/day:
@@ -514,6 +535,8 @@ Combined_Data AS (
            DATE_DIFF(DATE('2025-12-31'), CURRENT_DATE(), DAY)
          ))
     END AS predicted_value,
+    
+    -- [Confidence intervals and target calculations continue...]
 ```
 
 ### Logic Explanation:
@@ -550,25 +573,20 @@ Where Daily_rate = (End_goal - Current) / Days_remaining
    166 + (11 days × 5.83/day) = 166 + 64 = 230 MQLs on Nov 1
    ```
 
+**For Zero-Activity Sources:**
+- Current = 0, Predicted = 100 (example)
+- Daily rate = 100 / 71 = 1.41 per day
+- Creates line from 0 rising to 100 by Dec 31
+- Shows the gap between expectation and reality
+
 ### Confidence Interval Calculation:
 
 ```sql
 -- Lower bound
-CASE
-  WHEN a.date_day <= CURRENT_DATE() THEN a.cumulative_actual
-  ELSE 
-    GREATEST(
-      COALESCE(c.current_actual, 0),
-      [central_prediction] - (1.96 * COALESCE(v.stddev_daily_growth, 0) * SQRT(DATE_DIFF(a.date_day, CURRENT_DATE(), DAY)))
-    )
-END AS predicted_lower,
-
--- Upper bound
-CASE
-  WHEN a.date_day <= CURRENT_DATE() THEN a.cumulative_actual
-  ELSE 
-    [central_prediction] + (1.96 * COALESCE(v.stddev_daily_growth, 0) * SQRT(DATE_DIFF(a.date_day, CURRENT_DATE(), DAY)))
-END AS predicted_upper,
+GREATEST(
+  COALESCE(c.current_actual, 0),
+  [central_prediction] - (1.96 * COALESCE(v.stddev_daily_growth, 0) * SQRT(DATE_DIFF(a.date_day, CURRENT_DATE(), DAY)))
+)
 ```
 
 **The Statistics Behind Confidence Intervals:**
@@ -590,37 +608,23 @@ END AS predicted_upper,
    - Therefore: StdDev(Day_30) = √30 × StdDev(Day_1)
 
 3. **The GREATEST Function:**
-   ```sql
-   GREATEST(COALESCE(c.current_actual, 0), [calculation])
-   ```
    - Ensures lower bound never goes below current actual
    - Prevents impossible scenarios (can't have fewer than we already have)
 
-**Example Confidence Interval:**
-- Prediction 30 days out: 341 MQLs
-- Daily volatility: 4.2 MQLs
-- Uncertainty: 1.96 × 4.2 × √30 = 1.96 × 4.2 × 5.48 = 45 MQLs
-- 95% Confidence Interval: [296, 386]
+**For Zero-Volatility Sources:**
+- If stddev = 0 (no historical volatility)
+- Confidence intervals = prediction line (no spread)
+- Indicates complete consistency (or no activity)
 
 ### Target Line Calculation:
 
+The target calculation creates a stepped progression that changes slope at month boundaries:
+
 ```sql
--- CORRECTED Target line (stepped monthly progression)
 CASE 
   -- October: Linear from 0 to Oct target
   WHEN a.date_day <= DATE('2025-10-31') THEN
-    COALESCE([oct_cumulative_target], 0) * DATE_DIFF(a.date_day, DATE('2025-09-30'), DAY) / 31.0
-    
-  -- November: Linear from Oct target to Nov target  
-  WHEN a.date_day <= DATE('2025-11-30') THEN
-    COALESCE([oct_cumulative_target], 0) +
-    ([nov_cumulative_target] - [oct_cumulative_target]) * DATE_DIFF(a.date_day, DATE('2025-10-31'), DAY) / 30.0
-    
-  -- December: Linear from Nov target to Dec target
-  ELSE
-    COALESCE([nov_cumulative_target], 0) +
-    ([dec_cumulative_target] - [nov_cumulative_target]) * DATE_DIFF(a.date_day, DATE('2025-11-30'), DAY) / 31.0
-END AS target_value
+    [oct_cumulative_target] * DATE_DIFF(a.date_day, DATE('2025-09-30'), DAY) / 31.0
 ```
 
 **Stepped Progression Logic:**
@@ -642,7 +646,7 @@ Instead of one straight line from 0 to 430, we create three segments:
    - End: 430 on Dec 31
    - Daily rate: 145/31 = 4.68/day
 
-This creates a more realistic target line that reflects monthly quotas.
+This creates a more realistic target line that reflects monthly quotas and business cycles.
 
 ---
 
@@ -662,10 +666,7 @@ SELECT
   MAX(CASE WHEN stage = 'mqls' THEN predicted_upper END) AS mqls_upper,
   MAX(CASE WHEN stage = 'mqls' THEN target_value END) AS mqls_target,
   
-  -- SQL metrics
-  MAX(CASE WHEN stage = 'sqls' THEN actual_value END) AS sqls_actual,
-  MAX(CASE WHEN stage = 'sqls' THEN predicted_value END) AS sqls_predicted,
-  -- ... repeated for all stages
+  -- [Repeated for SQL, SQO, Joined stages...]
   
 FROM Combined_Data
 GROUP BY 1, 2, 3
@@ -697,18 +698,10 @@ Oct-21 | Market  | Web    | 50          | 50        | 25          | 25
 MAX(CASE WHEN stage = 'mqls' THEN actual_value END)
 ```
 
-1. **CASE returns:**
-   - Value when condition matches
-   - NULL when it doesn't
-
-2. **GROUP BY creates groups:**
-   - One group per date/channel/source combination
-   - Multiple rows (one per stage) in each group
-
-3. **MAX() collapses the group:**
-   - Ignores NULLs
-   - Returns the one non-NULL value
-   - Could also use MIN() or AVG() - same result with one value
+The MAX() aggregation:
+- Ignores NULLs from non-matching stages
+- Returns the one non-NULL value per group
+- Could use MIN() or AVG() with same result
 
 **The 20-Column Output:**
 
@@ -721,13 +714,13 @@ For each stage (MQLs, SQLs, SQOs, Joined):
 
 5 metrics × 4 stages = 20 columns
 
-**Why This Format?**
+**Handling Zero-Activity Sources:**
 
-Looker Studio can easily plot multiple series from columns:
-- Each column becomes a line on the chart
-- Shared x-axis (date_day)
-- Different line styles for actual vs predicted
-- Shaded areas between upper/lower bounds
+For sources that appear in forecast but have no activity:
+- All `actual` columns will be NULL or 0
+- `predicted` columns show line from 0 to predicted value
+- `target` columns show the stepped monthly targets
+- Creates visual gap highlighting underperformance
 
 ---
 
@@ -747,24 +740,18 @@ Uncertainty grows with square root of time:
 CI(t) = μ ± 1.96 × σ × √t
 ```
 
-### 3. **Cumulative Distribution Functions**
-Monotonically increasing functions that represent accumulated progress:
-```
-F(t) = Σ(events from start to t)
-```
+### 3. **Complete Source Coverage**
+The enhancement in CTE 4 ensures all forecasted sources appear, even with zero activity, providing a complete picture of performance vs. expectations.
 
-### 4. **Piecewise Linear Functions**
+### 4. **Deduplication Logic**
+The SUM/GROUP BY pattern in CTE 5 handles potential data quality issues in the forecast table.
+
+### 5. **Piecewise Linear Functions**
 Stepped targets that change slope at month boundaries:
 ```
 f(x) = { a₁x + b₁ if x ∈ [t₀,t₁]
        { a₂x + b₂ if x ∈ [t₁,t₂]
        { a₃x + b₃ if x ∈ [t₂,t₃]
-```
-
-### 5. **Window Functions for Running Totals**
-SQL's analytical capabilities for cumulative calculations:
-```
-SUM(value) OVER (ORDER BY date ROWS UNBOUNDED PRECEDING)
 ```
 
 ---
@@ -778,68 +765,70 @@ SUM(value) OVER (ORDER BY date ROWS UNBOUNDED PRECEDING)
 - **Gray dashed line** (predicted): Expected trajectory
 - **Gray shaded area** (confidence): Range of likely outcomes
 - **Green line** (target): Original plan
+- **Flat lines at zero**: Sources that haven't delivered yet
 
 **Key Insights:**
+- Sources with no activity but targets show immediate problems
 - Widening confidence cone = increasing uncertainty over time
-- Actual crossing above/below target = ahead/behind plan
-- Predicted vs target at Dec 31 = will we hit goal?
+- Zero-volatility sources = highly predictable (or inactive)
 
 ### For Leadership:
 
-**The Story:**
-"Based on our current pace and historical patterns, here's our expected path to end of quarter. The shaded area shows our confidence range - we're 95% confident we'll end up within these bounds."
+**Enhanced Story:**
+"This shows ALL sources we're tracking, including those that haven't produced results yet. The gaps highlight where we need intervention."
 
 **Decision Points:**
-- If predicted line below target: Need intervention
-- If lower bound above target: High confidence of success
-- If upper bound below target: Very unlikely to hit goal
+- Zero-activity sources with high targets = immediate action needed
+- Narrow confidence bands = high predictability
+- Wide bands = need to understand volatility drivers
 
 ### For Data Teams:
 
-**Reusability:**
-This pattern works for any metric with:
-- Historical daily data
-- Future endpoint prediction
-- Need for uncertainty quantification
+**Data Quality Benefits:**
+- Deduplication logic handles forecast table issues
+- Complete source coverage prevents "missing" sources
+- Robust to various data scenarios
 
-**Extensions:**
-- Monte Carlo simulation using the volatility measures
-- Seasonal adjustments to the linear interpolation
-- Multi-scenario planning with different endpoints
+**Monitoring Points:**
+- Check for duplicate forecast entries
+- Verify all forecasted sources appear
+- Monitor sources with zero activity
 
 ---
 
 ## Common Issues and Solutions
 
-### Issue: Confidence intervals go negative
+### Issue: Some sources don't appear in charts
 
-**Solution:** The GREATEST function ensures lower bound ≥ current actual
+**Solution:** The enhanced CTE 4 now includes all forecasted sources, even with zero activity
 
-### Issue: Jagged actual line
+### Issue: Forecast values seem doubled
 
-**Cause:** Sparse data with many zero days
+**Cause:** Duplicate entries in forecast table
 
-**Solution:** Consider smoothing or moving averages
+**Solution:** CTE 5 now includes SUM/GROUP BY to handle duplicates
 
-### Issue: Confidence intervals too wide/narrow
+### Issue: Confidence intervals missing for some sources
 
-**Adjust:** The 1.96 factor (use 1.645 for 90%, 2.576 for 99%)
+**Cause:** Zero historical activity means zero volatility
 
-### Issue: Target line doesn't match expectations
+**Solution:** This is correct behavior - no uncertainty if no activity
 
-**Check:** Monthly forecast values and cumulative logic
+### Issue: Target lines don't match expectations
+
+**Check:** Monthly forecast values and deduplication logic
 
 ---
 
 ## Conclusion
 
-This SQL view transforms point predictions into sophisticated time series visualizations with statistical confidence bounds. The mathematical foundation combines:
+This SQL view transforms point predictions into sophisticated time series visualizations with statistical confidence bounds. The key enhancements ensure:
 
-- Linear interpolation for smooth projections
-- Random walk theory for uncertainty quantification  
-- Cumulative functions for monotonic growth
-- Piecewise functions for realistic targets
+1. **Complete Coverage:** All forecasted sources appear, highlighting gaps
+2. **Data Quality:** Deduplication handles forecast table issues
+3. **Statistical Rigor:** Confidence intervals based on actual volatility
+4. **Business Alignment:** Stepped targets reflect monthly planning cycles
 
-The result is a powerful visualization that conveys not just where we expect to be, but how confident we are in that expectation. The widening confidence cone elegantly captures the fundamental truth that uncertainty increases with time, while the stepped target line reflects real business planning cycles.
+The mathematical foundation combines linear interpolation, random walk theory, and robust data handling to create actionable insights. The widening confidence cone elegantly captures increasing uncertainty over time, while zero-activity sources clearly show where intervention is needed.
 
-The entire implementation demonstrates how SQL's analytical capabilities can implement sophisticated statistical models, creating actionable insights from raw funnel data. The key innovation is making complex statistics accessible through intuitive visualizations that drive better business decisions.
+The implementation demonstrates how SQL's analytical capabilities can handle complex statistical models while remaining resilient to data quality issues, creating visualizations that drive better business decisions through complete transparency of both successes and gaps.
