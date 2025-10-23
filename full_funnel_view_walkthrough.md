@@ -2,8 +2,7 @@
 
 **Document Purpose:** This guide provides a detailed, step-by-step explanation of the main funnel view that serves as the foundation for all RevOps analytics, including how it combines lead and opportunity data into a unified funnel.
 
-**Target Audience:** RevOps professionals with basic statistics knowledge (undergraduate biology level)
-
+**Target Audience:** RevOps professionals with basic statistics knowledge
 **Last Updated:** October 22, 2025
 
 **Critical Context:** This view is being enhanced to support Re-Engagement Opportunities - a new pathway where advisors restart their journey directly as opportunities without going through the lead process.
@@ -534,5 +533,6 @@ WHERE Full_prospect_id__c IS NULL
 The `vw_funnel_lead_to_joined_v2` view is the cornerstone of RevOps analytics, elegantly handling the complexity of multiple revenue paths through a sophisticated JOIN strategy and careful field calculations. Its binary flags enable efficient mathematical operations, while its comprehensive fallback logic ensures no opportunity is missed.
 
 The upcoming enhancements for re-engagement opportunities will make this view even more complete, capturing the full customer lifecycle including win-back scenarios. The key to its success is the FULL OUTER JOIN pattern combined with robust NULL handling, creating a unified view of the entire revenue funnel regardless of entry point.
+
 
 This foundation enables all downstream analytics, from simple conversion rates to complex cohort analyses, making it the most critical view in the entire analytics infrastructure. Understanding its logic is essential for anyone working with RevOps data at scale.d
