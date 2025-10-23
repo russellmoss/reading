@@ -1,126 +1,125 @@
+# Complete Walkthrough: vw_forecast_vs_actuals SQL Logic and Mathematics
 
-# Complete Walkthrough: vw_forecast_vs_actuals (Active SGA Version) SQL Logic and Mathematics
-
-**Document Purpose:** This guide provides a detailed, step-by-step explanation of the SQL code that powers the forecast vs actuals view filtered for active SGAs, including the mathematical logic and statistical concepts behind each calculation.
-
-**Target Audience:** RevOps professionals with basic statistics knowledge 
-
-**Last Updated:** October 22, 2025
-
-**Key Difference:** This version filters all data to only include records associated with currently active Sales Generated Advisors (SGAs).
+**Document Purpose:** This guide provides a detailed, step-by-step explanation of the SQL code that powers the forecast vs actuals view, including the mathematical logic and statistical concepts behind each calculation.
+ 
+**Last Updated:** October 23, 2025
 
 ---
 
 ## Table of Contents
-1. [Overview: What This View Does](#overview)
-2. [CTE 1: Funnel_With_Flags - Creating the Foundation WITH Active SGA Filter](#cte1)
-3. [CTE 2: Forecast_Data - Importing Our Targets](#cte2)
-4. [CTE 3: Forecast_Q4_Total - Aggregating Quarterly Goals](#cte3)
-5. [CTE 4: QTD_Actuals - Measuring Current Performance](#cte4)
-6. [CTE 5: Trailing_Rates - The Heart of Prediction](#cte5)
-7. [CTE 6: Open_Pipeline - What's In Progress](#cte6)
-8. [CTE 7: Remaining_Forecast - Gap Analysis](#cte7)
-9. [CTE 8: Future_Conversions - The Prediction Engine](#cte8)
-10. [CTE 9: Historical_Volatility - Measuring Uncertainty](#cte9)
-11. [Final SELECT - Bringing It All Together](#final-select)
+1. [Overview: The Dual-Track Approach](#overview)
+2. [CTE 1: Funnel_With_Flags - Active Team Filter](#cte1)
+3. [CTE 2: Funnel_Unfiltered - Complete Historical Data](#cte2)
+4. [CTE 3: Forecast_Data - Standardizing Targets](#cte3)
+5. [CTE 4: Forecast_Q4_Total - Quarterly Aggregation](#cte4)
+6. [CTE 5: QTD_Actuals - What Really Happened](#cte5)
+7. [CTE 6: Trailing_Rates - Learning from Past Performance](#cte6)
+8. [CTE 7: Open_Pipeline - Work in Progress](#cte7)
+9. [CTE 8: Remaining_Forecast - The Gap Analysis](#cte8)
+10. [CTE 9: Future_Conversions - The Cascade Model](#cte9)
+11. [CTE 10: Historical_Volatility - Measuring Uncertainty](#cte10)
+12. [Final SELECT - Bringing It All Together](#final-select)
 
 ---
 
-## Overview: What This View Does {#overview}
+## Overview: The Dual-Track Approach {#overview}
 
-This view answers three critical questions for Q4 2025, **but only for active SGAs**:
-1. **Where are we?** (Actuals - only counting active SGA performance)
+This view answers three critical questions for Q4 2025:
+1. **Where are we?** (Actuals - counting everything that happened)
 2. **Where did we want to be?** (Forecast - original targets)
-3. **Where will we likely end up?** (Predictions - based on active SGA conversion rates)
+3. **Where will we likely end up?** (Predictions - based on current team capabilities)
 
-The key innovation in this version is filtering out inactive SGAs to get a cleaner picture of current team performance.
+The key innovation is a dual-track approach:
+- **Track 1: Unfiltered Data** - Used for actuals and volatility (what actually happened)
+- **Track 2: Filtered Data** - Used for conversion rates and predictions (what the current team can deliver)
+
+Think of it like tracking a relay race: You want to know the total distance covered (all runners' contributions) but predict the finish based on who's still running.
 
 ---
 
-## CTE 1: Funnel_With_Flags - Creating the Foundation WITH Active SGA Filter {#cte1}
+## CTE 1: Funnel_With_Flags - Active Team Filter {#cte1}
 
 ### Code:
 ```sql
-WITH
 Funnel_With_Flags AS (
   SELECT
     f.*,
     CASE WHEN LOWER(f.SQO_raw) = 'yes' THEN 1 ELSE 0 END AS is_sqo
   FROM `savvy-gtm-analytics.savvy_analytics.vw_funnel_lead_to_joined_v2` f
-  -- FILTER TO ACTIVE SGAs ONLY
-  INNER JOIN (
-    SELECT DISTINCT sga_name 
-    FROM `savvy-gtm-analytics.savvy_analytics.sga_qtly_goals_ext` 
-    WHERE sga_name IS NOT NULL
-  ) active_sgas
-  ON CASE
-    WHEN f.Full_prospect_id__c IS NULL THEN f.SGA_Owner_Name__c  -- Opp-only records
-    WHEN f.SGA_Owner_Name__c = 'Savvy Marketing' AND f.converted_oppty_id IS NOT NULL THEN f.SGA_Owner_Name__c  -- Marketing-sourced that converted
-    ELSE f.SGA_Owner_Name__c
-  END = active_sgas.sga_name
-),
+  WHERE 
+    (f.SGA_Owner_Name__c IN (
+      SELECT DISTINCT Name 
+      FROM `savvy-gtm-analytics.SavvyGTMData.User` 
+      WHERE (IsSGA__c = TRUE OR Is_SGM__c = TRUE)
+        AND IsActive = TRUE
+    ))
+    OR
+    (f.Opportunity_Owner_Name__c IN (
+      SELECT DISTINCT Name 
+      FROM `savvy-gtm-analytics.SavvyGTMData.User` 
+      WHERE (IsSGA__c = TRUE OR Is_SGM__c = TRUE)
+        AND IsActive = TRUE
+    ))
+)
 ```
 
 ### Logic Explanation:
 
-This CTE creates our foundational dataset with **a critical filter for active SGAs only**.
+This CTE creates our filtered dataset - only records owned by currently active sales team members.
 
-**The Active SGA Filter - Breaking It Down:**
-
-1. **The Subquery:**
-   ```sql
-   SELECT DISTINCT sga_name 
-   FROM `savvy-gtm-analytics.savvy_analytics.sga_qtly_goals_ext` 
-   WHERE sga_name IS NOT NULL
-   ```
-   - Pulls list of SGAs who have quarterly goals
-   - Having goals = active SGA
-   - `DISTINCT` ensures each SGA appears once
-   - `WHERE sga_name IS NOT NULL` excludes blank entries
-
-2. **The Complex JOIN Condition:**
-   ```sql
-   ON CASE
-     WHEN f.Full_prospect_id__c IS NULL THEN f.SGA_Owner_Name__c  -- Opp-only records
-     WHEN f.SGA_Owner_Name__c = 'Savvy Marketing' AND f.converted_oppty_id IS NOT NULL THEN f.SGA_Owner_Name__c
-     ELSE f.SGA_Owner_Name__c
-   END = active_sgas.sga_name
-   ```
-
-   **Let's decode this CASE statement:**
-   
-   - **Case 1: Opportunity-only records** (`Full_prospect_id__c IS NULL`)
-     - Some opportunities don't have lead history (direct referrals)
-     - For these, use the SGA_Owner_Name__c from the opportunity
-   
-   - **Case 2: Marketing-sourced conversions** 
-     - When `SGA_Owner_Name__c = 'Savvy Marketing'` AND it converted
-     - Keep attribution to Marketing (special SGA entity)
-     - Important for measuring marketing effectiveness
-   
-   - **Case 3: Everything else**
-     - Standard case - use the SGA owner from the lead
-
-3. **Why INNER JOIN Instead of LEFT JOIN?**
-   - `INNER JOIN` only keeps matches
-   - Records without active SGA attribution are **excluded**
-   - This means if an SGA left the company, their historical records don't count
-
-**Statistical Significance:**
-This filter creates a **survivorship bias** - we're only looking at currently successful SGAs. This gives us:
-- More optimistic conversion rates (successful SGAs stay, unsuccessful leave)
-- Cleaner predictions for current team capacity
-- Better alignment with actual achievable targets
-
-**The SQO Flag Creation:**
+**The Active Team Subquery:**
 ```sql
-CASE WHEN LOWER(f.SQO_raw) = 'yes' THEN 1 ELSE 0 END AS is_sqo
+SELECT DISTINCT Name 
+FROM `savvy-gtm-analytics.SavvyGTMData.User` 
+WHERE (IsSGA__c = TRUE OR Is_SGM__c = TRUE)
+  AND IsActive = TRUE
 ```
-Same as before - converts text to binary for mathematical operations.
+This identifies who's currently on the team. Think of it as taking attendance - who's here today to help us finish the quarter?
+
+**Why Two Owner Fields?**
+- `SGA_Owner_Name__c`: The lead owner (early funnel stages)
+- `Opportunity_Owner_Name__c`: The opportunity owner (later stages)
+- Using OR ensures we catch records at any stage owned by active team
+
+**Statistical Purpose:**
+This filtered data will be used to calculate conversion rates that reflect current team capabilities. It's like calculating a batting average only for players still on the roster - more predictive of future performance.
 
 ---
 
-## CTE 2: Forecast_Data - Importing Our Targets {#cte2}
+## CTE 2: Funnel_Unfiltered - Complete Historical Data {#cte2}
+
+### Code:
+```sql
+Funnel_Unfiltered AS (
+  SELECT
+    *,
+    CASE WHEN LOWER(SQO_raw) = 'yes' THEN 1 ELSE 0 END AS is_sqo
+  FROM `savvy-gtm-analytics.savvy_analytics.vw_funnel_lead_to_joined_v2`
+)
+```
+
+### Logic Explanation:
+
+This CTE pulls ALL historical data without any filtering.
+
+**Why Keep Both Filtered and Unfiltered?**
+Imagine you're tracking a marathon team's performance:
+- **Unfiltered (this CTE)**: Total miles run by everyone who participated, even those who dropped out
+- **Filtered (CTE 1)**: Only miles run by people still on the team
+
+We need both because:
+1. Management wants to know actual Q4 performance (unfiltered)
+2. But predictions should be based on who can actually deliver going forward (filtered)
+
+**The SQO Flag:**
+```sql
+CASE WHEN LOWER(SQO_raw) = 'yes' THEN 1 ELSE 0 END AS is_sqo
+```
+Converts text to binary (1/0) for mathematical operations. `LOWER()` handles case variations.
+
+---
+
+## CTE 3: Forecast_Data - Standardizing Targets {#cte3}
 
 ### Code:
 ```sql
@@ -140,21 +139,25 @@ Forecast_Data AS (
   FROM `savvy-gtm-analytics.SavvyGTMData.q4_2025_forecast`
   WHERE metric = 'Cohort_source'
     AND original_source != 'All'
-),
+)
 ```
 
 ### Logic Explanation:
 
-**No changes from original** - This CTE standardizes forecast data exactly as before.
+This standardizes naming conventions from the forecast table.
 
-**Important Note:** The forecast data is NOT filtered by active SGAs. This means:
-- Targets include expectations for SGAs who may have left
-- Creates a potential mismatch: comparing active SGA actuals to all-SGA targets
-- May need adjustment in interpretation
+**Key Transformations:**
+1. **Channel Rename:** 'Inbound' → 'Marketing' (aligning terminology)
+2. **Stage Pluralization:** 'mql' → 'mqls' (consistency with other views)
+3. **Data Type:** String to INT64 (ensuring mathematical operations work)
+
+**The Filter:**
+- `metric = 'Cohort_source'`: Source-level granularity
+- `original_source != 'All'`: Excludes rollup rows to avoid double-counting
 
 ---
 
-## CTE 3: Forecast_Q4_Total - Aggregating Quarterly Goals {#cte3}
+## CTE 4: Forecast_Q4_Total - Quarterly Aggregation {#cte4}
 
 ### Code:
 ```sql
@@ -166,57 +169,54 @@ Forecast_Q4_Total AS (
     SUM(forecast_value) AS forecast_value
   FROM Forecast_Data
   WHERE month_key IN ('2025-10', '2025-11', '2025-12')
-  GROUP BY 1, 2, 3
-),
+  GROUP BY channel_grouping_name, original_source, stage
+)
 ```
 
 ### Logic Explanation:
 
-**No changes from original** - Aggregates monthly forecasts into quarterly totals.
+Aggregates monthly forecasts into quarterly totals.
 
-The forecast remains the "ideal world" target, not adjusted for team changes.
+**The Mathematics:**
+If October target = 140, November = 145, December = 145
+Then Q4 total = 140 + 145 + 145 = 430
+
+This represents the original "stretch goal" set before the quarter began.
 
 ---
 
-## CTE 4: QTD_Actuals - Measuring Current Performance {#cte4}
+## CTE 5: QTD_Actuals - What Really Happened {#cte5}
 
 ### Code:
 ```sql
 QTD_Actuals AS (
-  SELECT channel_grouping_name, original_source, 'prospects' AS stage, 
-         COUNT(DISTINCT Full_prospect_id__c) AS actual_value
-  FROM Funnel_With_Flags
-  WHERE DATE(CreatedDate) BETWEEN '2025-10-01' AND CURRENT_DATE()
-  GROUP BY 1, 2
-  
-  UNION ALL
-  
   SELECT channel_grouping_name, original_source, 'mqls' AS stage,
          COUNT(DISTINCT Full_prospect_id__c) AS actual_value
-  FROM Funnel_With_Flags
+  FROM Funnel_Unfiltered  -- Note: Using UNFILTERED
   WHERE is_mql = 1 
     AND DATE(mql_stage_entered_ts) BETWEEN '2025-10-01' AND CURRENT_DATE()
   GROUP BY 1, 2
   
-  -- Similar patterns for sqls, sqos, joined...
-),
+  -- Similar UNION ALL sections for sqls, sqos, joined...
+)
 ```
 
 ### Logic Explanation:
 
-**Structurally identical to original**, but now only counting records from active SGAs due to the filter in CTE 1.
+This counts actual performance using **unfiltered data**.
 
-**What This Means:**
-- If an SGA left on October 10th, their Oct 1-10 MQLs are **not counted**
-- Only currently active team members' contributions appear
-- May show lower actuals than a full historical view
+**Critical Design Decision:**
+Uses `Funnel_Unfiltered` because actuals should reflect total team achievement, regardless of who's still employed. If someone made 50 sales then quit, those 50 sales still count toward Q4 actuals.
 
-**Business Impact:**
-This gives a "What can our current team deliver?" view rather than "What did we deliver historically?"
+**Different ID Fields by Stage:**
+- MQLs/SQLs: `COUNT(DISTINCT Full_prospect_id__c)` - counting leads
+- SQOs/Joined: `COUNT(DISTINCT Full_Opportunity_ID__c)` - counting opportunities
+
+This switch happens because leads convert to opportunities at the SQL→SQO transition.
 
 ---
 
-## CTE 5: Trailing_Rates - The Heart of Prediction {#cte5}
+## CTE 6: Trailing_Rates - Learning from Past Performance {#cte6}
 
 ### Code:
 ```sql
@@ -225,49 +225,41 @@ Trailing_Rates AS (
     channel_grouping_name,
     original_source,
     
-    -- Prospect to MQL rate
     SAFE_DIVIDE(
-      COUNT(DISTINCT IF(is_mql = 1, Full_prospect_id__c, NULL)), 
-      COUNT(DISTINCT IF(is_contacted = 1, Full_prospect_id__c, NULL))
-    ) AS prospect_to_mql_rate,
+      COUNT(DISTINCT IF(is_sql = 1, Full_prospect_id__c, NULL)), 
+      COUNT(DISTINCT IF(is_mql = 1, Full_prospect_id__c, NULL))
+    ) AS mql_to_sql_rate,
     
-    -- [other rates same as before...]
+    -- Other rates...
     
-  FROM Funnel_With_Flags
+  FROM Funnel_With_Flags  -- Note: Using FILTERED
   WHERE DATE(FilterDate) BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY) AND CURRENT_DATE()
   GROUP BY 1, 2
-),
+)
 ```
 
 ### Logic Explanation:
 
-**Calculates 90-day trailing conversion rates using only active SGA data.**
+Calculates conversion rates using **filtered data** (active team only).
 
-**Statistical Impact of Active-Only Filter:**
+**Why 90 Days?**
+Statistical principle: Larger sample sizes yield more stable estimates. 90 days balances:
+- Recency (relevant to current performance)
+- Sample size (enough data for reliability)
 
-1. **Higher Conversion Rates Expected:**
-   - Successful SGAs tend to stay
-   - Underperformers leave or are let go
-   - Result: Rates reflect "best of breed" performance
+**The SAFE_DIVIDE Function:**
+```sql
+SAFE_DIVIDE(numerator, denominator)
+```
+Returns NULL instead of error when denominator is zero. Essential for sources with no activity.
 
-2. **Smaller Sample Size:**
-   - Fewer SGAs = fewer data points
-   - May increase variance in rates
-   - Some channel/source combos might have insufficient data
-
-3. **More Relevant Predictions:**
-   - Rates reflect what current team can actually achieve
-   - Better predictor of future performance
-   - Removes noise from departed team members
-
-**Example Impact:**
-- Full team MQL→SQL rate: 45%
-- Active SGA only rate: 52%
-- The 7% difference reflects quality of retained team
+**Statistical Interpretation:**
+These rates answer: "If the current team gets 100 MQLs, how many will likely convert to SQL?"
+Not: "How did we perform historically?" (that would use unfiltered data)
 
 ---
 
-## CTE 6: Open_Pipeline - What's In Progress {#cte6}
+## CTE 7: Open_Pipeline - Work in Progress {#cte7}
 
 ### Code:
 ```sql
@@ -275,27 +267,29 @@ Open_Pipeline AS (
   SELECT
     channel_grouping_name,
     original_source,
-    COUNT(DISTINCT IF(is_contacted = 1 AND is_mql = 0, Full_prospect_id__c, NULL)) AS open_prospects,
-    -- [other counts...]
-  FROM Funnel_With_Flags
+    COUNT(DISTINCT IF(is_mql = 1 AND is_sql = 0, Full_prospect_id__c, NULL)) AS open_mqls,
+    -- Other open stages...
+  FROM Funnel_With_Flags  -- Note: Using FILTERED
   WHERE DATE(FilterDate) BETWEEN '2025-10-01' AND CURRENT_DATE()
     AND (StageName IS NULL OR StageName NOT LIKE '%Closed Lost%')
   GROUP BY 1, 2
-),
+)
 ```
 
 ### Logic Explanation:
 
-**Counts only open pipeline owned by active SGAs.**
+Counts in-progress records using **filtered data**.
 
-**Critical Business Context:**
-- If an SGA left with 50 open MQLs, those are **not** in this count
-- Assumes departed SGAs' pipeline was reassigned or lost
-- More conservative view of what can actually convert
+**Why Filtered?**
+Only the active team can work these opportunities. If someone left with 20 open MQLs and those weren't reassigned, including them would overstate what can actually convert.
+
+**The Stage Logic:**
+- `is_mql = 1 AND is_sql = 0`: Has become MQL but not yet SQL
+- Excludes 'Closed Lost' (failed opportunities that won't convert)
 
 ---
 
-## CTE 7: Remaining_Forecast - Gap Analysis {#cte7}
+## CTE 8: Remaining_Forecast - The Gap Analysis {#cte8}
 
 ### Code:
 ```sql
@@ -310,185 +304,174 @@ Remaining_Forecast AS (
     ON f.channel_grouping_name = a.channel_grouping_name
     AND f.original_source = a.original_source
     AND f.stage = a.stage
-),
+)
 ```
 
 ### Logic Explanation:
 
-**Creates a potentially misleading gap** because:
-- `forecast_value` = target for ALL SGAs (including departed)
-- `actual_value` = achievement by ACTIVE SGAs only
-- `remaining_value` = inflated gap
+Calculates how far behind (or ahead) we are versus plan.
 
-**Example Scenario:**
-- Original forecast: 100 MQLs (10 SGAs × 10 each)
-- 2 SGAs left the team
-- Active SGA actuals: 72 MQLs (8 SGAs × 9 each)
-- Remaining shows: 28 MQLs needed
-- Reality: Current team target should be 80, only 8 behind
+**The GREATEST Function:**
+```sql
+GREATEST(0, forecast - actual)
+```
+Ensures we never get negative remaining values. If we've exceeded forecast, remaining = 0.
+
+**Example:**
+- Forecast: 100 MQLs
+- Actual so far: 40 MQLs  
+- Remaining: GREATEST(0, 100 - 40) = 60 MQLs still needed
 
 ---
 
-## CTE 8: Future_Conversions - The Prediction Engine {#cte8}
+## CTE 9: Future_Conversions - The Cascade Model {#cte9}
 
-### Code remains structurally identical to original
+### Code:
+```sql
+Future_Conversions AS (
+  SELECT
+    -- Future MQLs = Open prospects converting + Remaining forecast prospects converting
+    (COALESCE(p.open_prospects, 0) * COALESCE(r.prospect_to_mql_rate, 0)) + 
+    (COALESCE(rf_p.remaining_value, 0) * COALESCE(r.prospect_to_mql_rate, 0)) AS future_mqls,
+    
+    -- Future SQLs = (Open MQLs + all future MQLs) * conversion rate
+    ((COALESCE(p.open_mqls, 0) + [future_mqls calculation])
+     * COALESCE(r.mql_to_sql_rate, 0)) AS future_sqls,
+    
+    -- Continues cascading through SQO and Joined...
+)
+```
 
 ### Logic Explanation:
 
-**Predictions are now based on:**
-- Open pipeline from active SGAs only
-- Conversion rates from active SGAs only
-- But remaining forecast from original (all SGA) targets
+This implements a cascade/waterfall model where each stage feeds the next.
 
-**This Creates an Interesting Dynamic:**
+**The Mathematics:**
+Think of it like a series of filters, each capturing a percentage:
 
-The formula becomes:
-```
-Future MQLs = (Active SGA Open Pipeline × Active SGA Rate) + 
-              (Original Remaining Target × Active SGA Rate)
-```
+1. **Future MQLs** = (Open Prospects × Rate) + (New Prospects × Rate)
+2. **Future SQLs** = (Current MQLs + Future MQLs) × MQL→SQL Rate
+3. **Future SQOs** = (Current SQLs + Future SQLs) × SQL→SQO Rate
+4. **Future Joined** = (Current SQOs + Future SQOs) × SQO→Joined Rate
 
-**Interpretation Challenge:**
-- Uses superior conversion rates (active SGAs)
-- Applied to potentially inflated remaining targets
-- May overpredict if team size has decreased significantly
+**Statistical Concept:**
+This is a Markov chain - a sequence where each state depends only on the previous state. The probability of reaching "Joined" = product of all intermediate conversion rates.
 
 ---
 
-## CTE 9: Historical_Volatility - Measuring Uncertainty {#cte9}
+## CTE 10: Historical_Volatility - Measuring Uncertainty {#cte10}
 
-### Code remains the same structurally
+### Code:
+```sql
+Historical_Volatility AS (
+  SELECT
+    channel_grouping_name,
+    original_source,
+    stage,
+    STDDEV(daily_count) AS stddev_daily
+  FROM (
+    SELECT DATE(mql_stage_entered_ts) AS event_date, channel_grouping_name, original_source,
+           'mqls' AS stage, COUNT(DISTINCT Full_prospect_id__c) AS daily_count
+    FROM Funnel_Unfiltered  -- Note: Using UNFILTERED
+    WHERE is_mql = 1 
+      AND DATE(mql_stage_entered_ts) BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY) AND CURRENT_DATE()
+    GROUP BY 1, 2, 3, 4
+  )
+  GROUP BY 1, 2, 3
+)
+```
 
 ### Logic Explanation:
 
-**Calculates daily volatility using only active SGA performance.**
+Calculates daily volatility using **unfiltered data** for the most complete picture.
 
-**Statistical Implications:**
-- Lower volatility expected (consistent performers retained)
-- Confidence intervals may be artificially narrow
-- Doesn't account for risk of further SGA departures
+**Why Standard Deviation?**
+It measures consistency. 
+- Low stddev (e.g., 2): Performance is predictable, varying by ±2 daily
+- High stddev (e.g., 15): Wild swings, hard to predict
+
+**Why Unfiltered for Volatility?**
+We want to know the true historical volatility of the business, not just the current team's consistency. This gives more conservative (realistic) confidence intervals.
+
+**Statistical Interpretation:**
+If stddev = 5, then:
+- 68% of days will be within ±5 of average (one standard deviation)
+- 95% of days will be within ±10 of average (two standard deviations)
 
 ---
 
 ## Final SELECT - Bringing It All Together {#final-select}
 
-### Code remains the same structurally
+### Code:
+```sql
+SELECT
+  COALESCE(a.channel_grouping_name, f.channel_grouping_name, fc.channel_grouping_name) AS channel_grouping_name,
+  -- Other dimensions...
+  
+  COALESCE(f.forecast_value, 0) AS forecast_value,
+  COALESCE(a.actual_value, 0) AS actual_value,
+  
+  CASE
+    WHEN stages.stage = 'prospects' THEN COALESCE(a.actual_value, 0)
+    WHEN stages.stage = 'mqls' THEN COALESCE(a.actual_value, 0) + COALESCE(fc.future_mqls, 0)
+    -- Other stages...
+  END AS predicted_value,
+  
+  hv.stddev_daily
+```
 
 ### Logic Explanation:
 
-**The output now represents:**
-- `forecast_value`: Original target (all SGAs)
-- `actual_value`: Current achievement (active SGAs only)
-- `predicted_value`: Expected end-of-quarter (based on active SGA performance)
-- `stddev_daily`: Volatility of active SGAs
+Combines all components into final metrics.
 
-**Key Interpretation Notes:**
+**The Prediction Formula:**
+```
+Predicted Value = Current Actual + Expected Future Conversions
+```
 
-1. **Forecast vs Actual Comparison:**
-   - Not apples-to-apples if team size changed
-   - Consider adjusting forecast proportionally to team size
+**COALESCE Cascade:**
+Handles missing data gracefully by checking multiple sources in order. Essential because not all channel/source combinations exist in all CTEs.
 
-2. **Prediction Reliability:**
-   - More accurate for current team capacity
-   - Doesn't account for hiring/departures during quarter
-   - Optimistic bias from survivor effect
-
-3. **Recommended Adjustments:**
-   ```sql
-   Adjusted_Forecast = Original_Forecast × (Active_SGAs / Original_SGAs)
-   ```
+**The Output:**
+- **forecast_value**: Original target (what we hoped for)
+- **actual_value**: Current reality (where we are)
+- **predicted_value**: Expected outcome (where we'll likely end)
+- **stddev_daily**: Volatility measure (how certain we are)
 
 ---
 
 ## Statistical Summary
 
-This version introduces **survivorship bias** into the analysis:
+This view implements sophisticated predictive analytics through:
 
-**Advantages:**
-- More accurate view of current team capability
-- Better conversion rates for planning
-- Cleaner data without departed SGA noise
+1. **Dual-Track Data Strategy**
+   - Historical accuracy (unfiltered actuals)
+   - Realistic predictions (filtered rates)
 
-**Disadvantages:**
-- Historical comparisons become invalid
-- Forecast targets may be unrealistic for smaller team
-- Confidence intervals too narrow
+2. **Cascade Modeling**
+   - Multi-stage conversion waterfall
+   - Compound probability calculations
 
-**The Mathematics:**
-```
-Active_SGA_Prediction = Current_Actuals(active) + 
-                       Pipeline(active) × Rates(active) +
-                       Remaining_Forecast(all) × Rates(active)
-```
+3. **Uncertainty Quantification**
+   - Standard deviation for volatility
+   - Based on comprehensive historical data
 
----
+The mathematics tell a story: "Here's what happened (actuals), here's what we wanted (forecast), and based on our current team's capabilities and pipeline, here's where we'll likely end up (predictions)."
 
-## Practical Applications
-
-### For RevOps Teams:
-
-**Adjustments Needed:**
-1. Track active SGA count vs original planning count
-2. Adjust forecast targets proportionally
-3. Consider separate "coverage" metric
-
-**Example Adjustment:**
-```sql
--- Add this CTE for context
-Team_Size_Adjustment AS (
-  SELECT 
-    COUNT(DISTINCT sga_name) as active_sga_count,
-    10 as original_sga_count,  -- Or pull from planning table
-    COUNT(DISTINCT sga_name) / 10.0 as size_ratio
-  FROM active_sgas
-)
-```
-
-### For Leadership:
-
-**The Story Changes To:**
-"Based on our **current active team's** pipeline and performance, here's where we'll end the quarter. Note that our forecast was set for a larger team."
-
-**Key Questions:**
-- Should we adjust targets for team size?
-- Are we hiring to fill gaps?
-- Is the higher conversion rate sustainable?
-
-### For Data Teams:
-
-**Consider Creating Two Views:**
-1. This version (active SGAs) for forward-looking predictions
-2. Original version (all historical) for true performance tracking
-3. Reconciliation view showing the impact of team changes
+Think of it like predicting a baseball team's season: You count all runs scored so far (even by traded players), but predict future performance based on the current roster's batting averages.
 
 ---
 
-## Common Issues and Solutions
+## Practical Implications
 
-### Issue: Predictions exceed forecast despite being behind
+**For Leadership:**
+- **Actuals** show true Q4 performance (accountability)
+- **Predictions** show realistic end-of-quarter outcomes (planning)
+- **Volatility** indicates confidence level (risk assessment)
 
-**Cause:** Superior active SGA rates applied to full remaining forecast
+**For RevOps:**
+- Conversion rates based on performers still here (actionable)
+- Open pipeline filtered to workable opportunities (realistic)
+- Historical volatility for confidence intervals (honest uncertainty)
 
-**Solution:** Adjust remaining forecast for team size
-
-### Issue: Historical trends broken
-
-**Cause:** Comparing active-only to historical all-SGA metrics
-
-**Solution:** Maintain parallel tracking or note the methodology change
-
-### Issue: Some sources show no data
-
-**Cause:** Only inactive SGAs worked those sources
-
-**Solution:** Document and consider reassignment strategy
-
----
-
-## Conclusion
-
-This active-SGA-filtered version provides a more realistic view of what the current team can achieve, but at the cost of historical comparability. The survivorship bias creates optimistic conversion rates that may not be sustainable if team composition changes. 
-
-The key insight is that this view answers "What can our current team deliver?" rather than "How are we performing against original plans?" Both questions are valuable, but it's critical to understand which one you're answering when making decisions based on this data.
-
-For maximum value, this view should be used alongside team size metrics and potentially adjusted forecasts that account for staffing changes. The mathematics remain sound, but the interpretation requires more nuance when the underlying population (active SGAs) differs from the planning population (all originally planned SGAs).
+The dual-track approach ensures we're neither overly optimistic (counting on departed staff) nor artificially pessimistic (ignoring their past contributions). It's the statistical equivalent of "trust but verify" - acknowledging reality while planning pragmatically.
